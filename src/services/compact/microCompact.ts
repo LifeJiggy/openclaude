@@ -20,6 +20,7 @@ import {
 } from '../analytics/index.js'
 import { notifyCacheDeletion } from '../api/promptCacheBreakDetection.js'
 import { roughTokenCountEstimation } from '../tokenEstimation.js'
+import { getContextWindowForModel } from '../../utils/context.js'
 import {
   clearCompactWarningSuppression,
   suppressCompactWarning,
@@ -256,6 +257,51 @@ function isMainThreadSource(querySource: QuerySource | undefined): boolean {
   return !querySource || querySource.startsWith('repl_main_thread')
 }
 
+/**
+ * Semantic compression check for tight contexts.
+ */
+async function maybeSemanticCompression(messages: Message[]): Promise<MicrocompactResult | null> {
+  if (!feature('SEMANTIC_COMPRESSION')) return null
+  
+  const totalTokens = messages.reduce((sum, m) => {
+    const content = typeof m.message?.content === 'string' 
+      ? m.message.content 
+      : Array.isArray(m.message?.content) 
+        ? JSON.stringify(m.message.content) 
+        : ''
+    return sum + roughTokenCountEstimation(content)
+  }, 0)
+  
+  const contextWindow = getContextWindowForModel(getMainLoopModel())
+  if (totalTokens > contextWindow * 0.8) {
+    const { semanticCompress } = await import('../../utils/semanticCompression.js')
+    const compressedMessages: Message[] = []
+    
+    for (const msg of messages) {
+      const content = typeof msg.message?.content === 'string' 
+        ? msg.message.content 
+        : Array.isArray(msg.message?.content) 
+          ? JSON.stringify(msg.message.content) 
+          : ''
+      
+      const result = semanticCompress(content, { targetRatio: 0.7, preserveMeaning: true })
+      const newContent = result.compressed
+      
+      compressedMessages.push({
+        ...msg,
+        message: {
+          ...msg.message,
+          content: newContent,
+        },
+      })
+    }
+    
+    return { messages: compressedMessages }
+  }
+  
+  return null
+}
+
 export async function microcompactMessages(
   messages: Message[],
   toolUseContext?: ToolUseContext,
@@ -273,6 +319,11 @@ export async function microcompactMessages(
   const timeBasedResult = maybeTimeBasedMicrocompact(messages, querySource)
   if (timeBasedResult) {
     return timeBasedResult
+  }
+
+  const semanticResult = await maybeSemanticCompression(messages)
+  if (semanticResult) {
+    return semanticResult
   }
 
   // Only run cached MC for the main thread to prevent forked agents
